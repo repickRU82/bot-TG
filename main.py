@@ -133,6 +133,7 @@ async def startup(bot: Bot, db: Database, settings) -> None:
     if getattr(settings, "bot_pin", None):
         cmds.append(BotCommand(command="pin", description="Ввести PIN-код"))
     cmds.append(BotCommand(command="admin", description="Админ-панель (superadmin)"))
+    cmds.append(BotCommand(command="admindel", description="Удалить заявку по ID (superadmin)"))
 
     try:
         await bot.set_my_commands(cmds)

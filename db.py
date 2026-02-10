@@ -680,6 +680,43 @@ class Database:
                 "authed_count": authed_count,
             }
 
+    async def delete_request_by_admin(self, request_id: int, actor_tg_id: int) -> bool:
+        async with aiosqlite.connect(self.db_path.as_posix()) as db:
+            await self._configure(db)
+            try:
+                await db.execute("BEGIN IMMEDIATE;")
+
+                req = await self._get_request_tx(db, request_id)
+                if not req:
+                    await db.execute("ROLLBACK;")
+                    return False
+
+                items = await self._get_request_items_tx(db, request_id)
+                for it in items:
+                    await db.execute(
+                        "UPDATE tokens SET status=? WHERE token_id=? AND status IN (?, ?, ?);",
+                        (TOKEN_AVAILABLE, it["token_id"], TOKEN_RESERVED, TOKEN_ISSUED, TOKEN_AVAILABLE),
+                    )
+
+                payload = {
+                    "deleted_request_id": request_id,
+                    "deleted_status": req.status,
+                    "deleted_by": actor_tg_id,
+                    "items": items,
+                }
+                await db.execute(
+                    "INSERT INTO audit_log(request_id, actor_tg_id, action, payload) VALUES(NULL, ?, ?, ?);",
+                    (actor_tg_id, "ADMIN_DELETE_REQUEST", json.dumps(payload, ensure_ascii=False)),
+                )
+
+                await db.execute("DELETE FROM audit_log WHERE request_id=?;", (request_id,))
+                await db.execute("DELETE FROM requests WHERE id=?;", (request_id,))
+                await db.commit()
+                return True
+            except Exception:
+                await db.execute("ROLLBACK;")
+                raise
+
     async def cleanup_old_data(self, days: int = 90) -> int:
         async with aiosqlite.connect(self.db_path.as_posix()) as db:
             await self._configure(db)

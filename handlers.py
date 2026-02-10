@@ -806,6 +806,33 @@ async def cmd_admin(message: Message, settings) -> None:
     await message.answer("🛠 <b>Админ-панель</b>", reply_markup=kb_admin_menu())
 
 
+@router.message(Command("admindel"))
+async def cmd_admindel(message: Message, db: Database, settings) -> None:
+    uid = message.from_user.id
+    if not is_superadmin(uid, settings):
+        await message.answer("⛔ Нет доступа.")
+        return
+
+    parts = (message.text or "").strip().split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        await message.answer(
+            "Использование: <code>/admindel ID_ЗАЯВКИ</code>\n"
+            "Например: <code>/admindel 123</code>"
+        )
+        return
+
+    request_id = int(parts[1].strip())
+    deleted = await db.delete_request_by_admin(request_id=request_id, actor_tg_id=uid)
+    if not deleted:
+        await message.answer(f"Заявка #{request_id} не найдена.")
+        return
+
+    await message.answer(
+        f"🗑 Заявка <b>#{request_id}</b> удалена.\n"
+        "Связанные токены возвращены в состояние available."
+    )
+
+
 @router.callback_query(F.data.startswith("adm:"))
 async def cb_admin(call: CallbackQuery, db: Database, settings) -> None:
     uid = call.from_user.id
@@ -941,6 +968,24 @@ async def cb_admin(call: CallbackQuery, db: Database, settings) -> None:
             text.append(request_card_text(r, items))
             text.append("—" * 20)
         await safe_edit_text(call, "\n".join(text), reply_markup=kb_back_to_admin())
+        await call.answer()
+        return
+
+    if data == "adm:delete_help":
+        rows = await db.list_last_requests(limit=20)
+        lines = [
+            "🗑 <b>Удаление заявки (superadmin)</b>",
+            "",
+            "Команда: <code>/admindel ID_ЗАЯВКИ</code>",
+            "",
+            "Последние ID:",
+        ]
+        if rows:
+            lines.extend([f"• #{r.id} — {r.status}" for r in rows])
+        else:
+            lines.append("(заявок пока нет)")
+
+        await safe_edit_text(call, "\n".join(lines), reply_markup=kb_back_to_admin())
         await call.answer()
         return
 
