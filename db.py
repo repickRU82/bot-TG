@@ -117,12 +117,25 @@ class Database:
                   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 );
 
+                CREATE TABLE IF NOT EXISTS token_waitlist(
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  tg_id INTEGER NOT NULL,
+                  token_id TEXT NOT NULL,
+                  company TEXT,
+                  active INTEGER NOT NULL DEFAULT 1,
+                  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                  notified_at DATETIME,
+                  UNIQUE(tg_id, token_id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_tokens_status ON tokens(status);
                 CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status);
                 CREATE INDEX IF NOT EXISTS idx_requests_tg_id ON requests(tg_id);
                 CREATE INDEX IF NOT EXISTS idx_requests_requested_at ON requests(requested_at);
                 CREATE INDEX IF NOT EXISTS idx_request_items_request_id ON request_items(request_id);
                 CREATE INDEX IF NOT EXISTS idx_audit_request_id ON audit_log(request_id);
+                CREATE INDEX IF NOT EXISTS idx_waitlist_token_active ON token_waitlist(token_id, active, created_at);
+                CREATE INDEX IF NOT EXISTS idx_waitlist_user_active ON token_waitlist(tg_id, active, created_at);
                 """
             )
 
@@ -254,6 +267,85 @@ class Database:
             )
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
+
+    # -------------------------
+    # Waitlist (очередь на токены)
+    # -------------------------
+    async def join_waitlist(self, tg_id: int, token_id: str, company: str) -> bool:
+        """Добавляет пользователя в очередь на токен. True — если новая запись/реактивация."""
+        async with aiosqlite.connect(self.db_path.as_posix()) as db:
+            await self._configure(db)
+            cur = await db.execute(
+                "SELECT active FROM token_waitlist WHERE tg_id=? AND token_id=?;",
+                (tg_id, token_id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                await db.execute(
+                    "INSERT INTO token_waitlist(tg_id, token_id, company, active, created_at, notified_at) "
+                    "VALUES(?, ?, ?, 1, CURRENT_TIMESTAMP, NULL);",
+                    (tg_id, token_id, company),
+                )
+                await db.commit()
+                return True
+
+            if int(row["active"]) == 1:
+                return False
+
+            await db.execute(
+                "UPDATE token_waitlist SET active=1, company=?, created_at=CURRENT_TIMESTAMP, notified_at=NULL "
+                "WHERE tg_id=? AND token_id=?;",
+                (company, tg_id, token_id),
+            )
+            await db.commit()
+            return True
+
+    async def list_user_waitlist(self, tg_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+        async with aiosqlite.connect(self.db_path.as_posix()) as db:
+            await self._configure(db)
+            cur = await db.execute(
+                "SELECT token_id, company, created_at FROM token_waitlist "
+                "WHERE tg_id=? AND active=1 ORDER BY created_at ASC LIMIT ?;",
+                (tg_id, limit),
+            )
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def pop_waiters_for_available_tokens(self, token_ids: List[str]) -> List[Dict[str, Any]]:
+        """Возвращает и деактивирует очередь для освободившихся токенов."""
+        if not token_ids:
+            return []
+
+        clean_ids = sorted({str(x).strip() for x in token_ids if str(x).strip()})
+        if not clean_ids:
+            return []
+
+        placeholders = ",".join(["?"] * len(clean_ids))
+        async with aiosqlite.connect(self.db_path.as_posix()) as db:
+            await self._configure(db)
+            try:
+                await db.execute("BEGIN IMMEDIATE;")
+                cur = await db.execute(
+                    f"SELECT id, tg_id, token_id, company FROM token_waitlist "
+                    f"WHERE active=1 AND token_id IN ({placeholders}) ORDER BY created_at ASC;",
+                    clean_ids,
+                )
+                rows = [dict(r) for r in await cur.fetchall()]
+                if not rows:
+                    await db.execute("ROLLBACK;")
+                    return []
+
+                row_ids = [int(r["id"]) for r in rows]
+                placeholders2 = ",".join(["?"] * len(row_ids))
+                await db.execute(
+                    f"UPDATE token_waitlist SET active=0, notified_at=CURRENT_TIMESTAMP WHERE id IN ({placeholders2});",
+                    row_ids,
+                )
+                await db.commit()
+                return rows
+            except Exception:
+                await db.execute("ROLLBACK;")
+                raise
 
     # -------------------------
     # Tokens
