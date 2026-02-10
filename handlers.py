@@ -76,6 +76,7 @@ def help_text() -> str:
         f"• <b>{BTN_PENDING}</b> — раздел для директора (согласование заявок)\n"
         f"• <b>{BTN_ACTIVE}</b> — раздел для уполномоченного (выдача/приём токенов)\n"
         f"• <b>{BTN_HELP}</b> — показать эту справку\n"
+        "• <b>/profile</b> — посмотреть/обновить ФИО\n"
         f"• <b>{BTN_CANCEL}</b> — отменить текущее действие\n\n"
         "Если что-то не получается — напишите системному администратору."
     )
@@ -85,6 +86,7 @@ def help_text() -> str:
 # States / FSM
 # -------------------------
 class RequestFSM(StatesGroup):
+    full_name = State()
     companies = State()
     purpose = State()
     comment = State()
@@ -170,6 +172,36 @@ async def cmd_help(message: Message) -> None:
     await message.answer(help_text(), reply_markup=main_menu_kb())
 
 
+@router.message(Command("profile"))
+async def cmd_profile(message: Message, db: Database) -> None:
+    current = await db.get_user_full_name(message.from_user.id)
+    text = (message.text or "").strip()
+    parts = text.split(maxsplit=1)
+
+    if len(parts) == 1:
+        if current:
+            await message.answer(
+                f"🪪 Ваше ФИО: <b>{current}</b>\n\n"
+                "Чтобы обновить, отправьте: <code>/profile Фамилия Имя Отчество</code>"
+            )
+        else:
+            await message.answer(
+                "ФИО не задано. Установите так: <code>/profile Фамилия Имя Отчество</code>"
+            )
+        return
+
+    full_name = " ".join(parts[1].strip().split())
+    if len(full_name) < 5 or " " not in full_name:
+        await message.answer("Некорректное ФИО. Пример: /profile Иванов Иван Иванович")
+        return
+    if len(full_name) > 120:
+        await message.answer("ФИО слишком длинное. Максимум 120 символов.")
+        return
+
+    await db.set_user_full_name(message.from_user.id, full_name)
+    await message.answer(f"✅ ФИО обновлено: <b>{full_name}</b>")
+
+
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext) -> None:
     current_state = await state.get_state()
@@ -181,9 +213,9 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
     await message.answer("❌ Действие отменено.", reply_markup=main_menu_kb())
 
 @router.message(Command("request"))
-async def cmd_request_alias(message: Message, state: FSMContext, settings) -> None:
+async def cmd_request_alias(message: Message, state: FSMContext, settings, db: Database) -> None:
     # Шорткат к кнопке "✅ Создать заявку"
-    await cmd_request(message, state, settings)
+    await cmd_request(message, state, settings, db)
 
 
 @router.message(Command("my"))
@@ -217,8 +249,8 @@ async def btn_cancel(message: Message, state: FSMContext) -> None:
 
 
 @router.message(F.text == BTN_REQUEST)
-async def btn_request(message: Message, state: FSMContext, settings) -> None:
-    await cmd_request(message, state, settings)
+async def btn_request(message: Message, state: FSMContext, settings, db: Database) -> None:
+    await cmd_request(message, state, settings, db)
 
 
 @router.message(F.text == BTN_MY)
@@ -262,17 +294,32 @@ async def cmd_my(message: Message, db: Database) -> None:
         await message.answer("Ошибка при загрузке заявок.", reply_markup=main_menu_kb())
 
 
-async def cmd_request(message: Message, state: FSMContext, settings) -> None:
-    await state.clear()
+async def _start_request_companies_step(message: Message, state: FSMContext, settings) -> None:
     await state.set_state(RequestFSM.companies)
     await state.update_data(selected_companies=[])
-    max_companies = getattr(settings, 'max_companies_per_request', 5)
+    max_companies = getattr(settings, "max_companies_per_request", 5)
 
     await message.answer(
         f"📋 <b>Создание заявки</b>\n\n"
         f"Выберите компании (можно несколько, максимум {max_companies}).",
         reply_markup=kb_companies_multi(set(), max_companies),
     )
+
+
+async def cmd_request(message: Message, state: FSMContext, settings, db: Database) -> None:
+    await state.clear()
+
+    full_name = await db.get_user_full_name(message.from_user.id)
+    if not full_name:
+        await state.set_state(RequestFSM.full_name)
+        await message.answer(
+            "🪪 <b>Идентификация пользователя</b>\n\n"
+            "Перед первой заявкой укажите ваше ФИО (например: <i>Иванов Иван Иванович</i>).\n"
+            "Это ФИО будет привязано к вашему tg_id и отображаться в заявках."
+        )
+        return
+
+    await _start_request_companies_step(message, state, settings)
 
 
 async def cmd_pending(message: Message, db: Database, settings) -> None:
@@ -316,6 +363,25 @@ async def cmd_active(message: Message, db: Database, settings) -> None:
             request_card_text(r, items),
             reply_markup=kb_officer_actions(r.id, r.status),
         )
+
+
+@router.message(RequestFSM.full_name)
+async def msg_full_name(message: Message, state: FSMContext, db: Database, settings) -> None:
+    full_name = " ".join((message.text or "").strip().split())
+    if len(full_name) < 5:
+        await message.answer("ФИО слишком короткое. Пример: Иванов Иван Иванович")
+        return
+    if len(full_name) > 120:
+        await message.answer("ФИО слишком длинное. Максимум 120 символов.")
+        return
+    if " " not in full_name:
+        await message.answer("Укажите минимум имя и фамилию через пробел.")
+        return
+
+    await db.set_user_full_name(message.from_user.id, full_name)
+    await state.update_data(full_name=full_name)
+    await message.answer(f"✅ ФИО сохранено: <b>{full_name}</b>")
+    await _start_request_companies_step(message, state, settings)
 
 
 # -------------------------
@@ -440,7 +506,9 @@ async def msg_comment(message: Message, state: FSMContext, db: Database, setting
     try:
         request_id = await db.create_request_multi(
             tg_id=message.from_user.id,
-            username=message.from_user.username or "",
+            username=(await db.get_user_full_name(message.from_user.id))
+            or (message.from_user.full_name if message.from_user else "")
+            or (message.from_user.username or ""),
             items=items,
             purpose=purpose,
             comment=comment or None,
