@@ -111,6 +111,12 @@ class Database:
                   authed_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 );
 
+                CREATE TABLE IF NOT EXISTS user_profiles(
+                  tg_id INTEGER PRIMARY KEY,
+                  full_name TEXT NOT NULL,
+                  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_tokens_status ON tokens(status);
                 CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status);
                 CREATE INDEX IF NOT EXISTS idx_requests_tg_id ON requests(tg_id);
@@ -182,6 +188,37 @@ class Database:
             "INSERT INTO audit_log(request_id, actor_tg_id, action, payload) VALUES(?, ?, ?, ?);",
             (request_id, actor_tg_id, action, json.dumps(payload, ensure_ascii=False)),
         )
+
+
+    # -------------------------
+    # User profile (FIO)
+    # -------------------------
+    async def get_user_full_name(self, tg_id: int) -> Optional[str]:
+        async with aiosqlite.connect(self.db_path.as_posix()) as db:
+            await self._configure(db)
+            cur = await db.execute("SELECT full_name FROM user_profiles WHERE tg_id=?;", (tg_id,))
+            row = await cur.fetchone()
+            if not row:
+                return None
+            name = str(row["full_name"] or "").strip()
+            return name or None
+
+    async def set_user_full_name(self, tg_id: int, full_name: str) -> None:
+        value = str(full_name or "").strip()
+        if not value:
+            raise ValueError("full_name is empty")
+        async with aiosqlite.connect(self.db_path.as_posix()) as db:
+            await self._configure(db)
+            await db.execute(
+                "INSERT INTO user_profiles(tg_id, full_name, updated_at) VALUES(?, ?, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(tg_id) DO UPDATE SET full_name=excluded.full_name, updated_at=CURRENT_TIMESTAMP;",
+                (tg_id, value),
+            )
+            await db.execute(
+                "UPDATE requests SET username=? WHERE tg_id=? AND (username IS NULL OR TRIM(username)='');",
+                (value, tg_id),
+            )
+            await db.commit()
 
     # -------------------------
     # PIN auth
@@ -642,6 +679,43 @@ class Database:
                 "users_count": users_count,
                 "authed_count": authed_count,
             }
+
+    async def delete_request_by_admin(self, request_id: int, actor_tg_id: int) -> bool:
+        async with aiosqlite.connect(self.db_path.as_posix()) as db:
+            await self._configure(db)
+            try:
+                await db.execute("BEGIN IMMEDIATE;")
+
+                req = await self._get_request_tx(db, request_id)
+                if not req:
+                    await db.execute("ROLLBACK;")
+                    return False
+
+                items = await self._get_request_items_tx(db, request_id)
+                for it in items:
+                    await db.execute(
+                        "UPDATE tokens SET status=? WHERE token_id=? AND status IN (?, ?, ?);",
+                        (TOKEN_AVAILABLE, it["token_id"], TOKEN_RESERVED, TOKEN_ISSUED, TOKEN_AVAILABLE),
+                    )
+
+                payload = {
+                    "deleted_request_id": request_id,
+                    "deleted_status": req.status,
+                    "deleted_by": actor_tg_id,
+                    "items": items,
+                }
+                await db.execute(
+                    "INSERT INTO audit_log(request_id, actor_tg_id, action, payload) VALUES(NULL, ?, ?, ?);",
+                    (actor_tg_id, "ADMIN_DELETE_REQUEST", json.dumps(payload, ensure_ascii=False)),
+                )
+
+                await db.execute("DELETE FROM audit_log WHERE request_id=?;", (request_id,))
+                await db.execute("DELETE FROM requests WHERE id=?;", (request_id,))
+                await db.commit()
+                return True
+            except Exception:
+                await db.execute("ROLLBACK;")
+                raise
 
     async def cleanup_old_data(self, days: int = 90) -> int:
         async with aiosqlite.connect(self.db_path.as_posix()) as db:

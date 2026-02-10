@@ -465,9 +465,10 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     kb.button(text="⏱ Висяки >30 мин", callback_data="adm:over:1800")
     kb.button(text="⏱ Висяки >2 часа", callback_data="adm:over:7200")
     kb.button(text="⏱ Висяки >1 день", callback_data="adm:over:86400")
+    kb.button(text="🗑 Удалить заявку", callback_data="adm:delete_help")
     kb.button(text="🧹 Очистка старых", callback_data="adm:cleanup")
     kb.button(text="🔄 Проверить WebDAV", callback_data="adm:webdav")
-    kb.adjust(1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 1, 1)
+    kb.adjust(1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 1, 1, 1)
     return kb.as_markup()
 
 
