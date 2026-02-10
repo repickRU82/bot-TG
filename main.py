@@ -123,6 +123,7 @@ async def startup(bot: Bot, db: Database, settings) -> None:
     cmds = [
         BotCommand(command="menu", description="Показать меню"),
         BotCommand(command="help", description="Справка"),
+        BotCommand(command="profile", description="Профиль / ФИО"),
         BotCommand(command="cancel", description="Отмена"),
         BotCommand(command="request", description="Создать заявку"),
         BotCommand(command="my", description="Мои заявки"),

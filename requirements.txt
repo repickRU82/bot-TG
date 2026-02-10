@@ -1,0 +1,8 @@
+aiogram==3.10.0
+aiofiles==23.2.1
+aiosqlite==0.20.0
+python-dotenv==1.0.0
+openpyxl==3.1.2
+webdavclient3==3.14.6
+pytz==2024.1
+tzdata==2024.1

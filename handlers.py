@@ -50,6 +50,7 @@ BTN_MY = "📋 Мои заявки"
 BTN_PENDING = "🧑‍💼 Директор: На согласовании"
 BTN_ACTIVE = "🛡 Уполномоченный: Активные"
 BTN_HELP = "ℹ️ Помощь"
+BTN_PROFILE = "🪪 Профиль (ФИО)"
 BTN_CANCEL = "❌ Отмена"
 
 
@@ -60,7 +61,8 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
             [KeyboardButton(text=BTN_MY)],
             [KeyboardButton(text=BTN_PENDING)],
             [KeyboardButton(text=BTN_ACTIVE)],
-            [KeyboardButton(text=BTN_HELP), KeyboardButton(text=BTN_CANCEL)],
+            [KeyboardButton(text=BTN_HELP), KeyboardButton(text=BTN_PROFILE)],
+            [KeyboardButton(text=BTN_CANCEL)],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -76,6 +78,8 @@ def help_text() -> str:
         f"• <b>{BTN_PENDING}</b> — раздел для директора (согласование заявок)\n"
         f"• <b>{BTN_ACTIVE}</b> — раздел для уполномоченного (выдача/приём токенов)\n"
         f"• <b>{BTN_HELP}</b> — показать эту справку\n"
+        f"• <b>{BTN_PROFILE}</b> — заполнить/обновить ФИО\n"
+        "• <b>/profile</b> — то же действие командой\n"
         f"• <b>{BTN_CANCEL}</b> — отменить текущее действие\n\n"
         "Если что-то не получается — напишите системному администратору."
     )
@@ -85,9 +89,9 @@ def help_text() -> str:
 # States / FSM
 # -------------------------
 class RequestFSM(StatesGroup):
+    full_name = State()
     companies = State()
     purpose = State()
-    comment = State()
 
 
 # -------------------------
@@ -150,7 +154,7 @@ async def safe_append_journal(
 # Commands
 # -------------------------
 @router.message(CommandStart())
-async def cmd_start(message: Message) -> None:
+async def cmd_start(message: Message, db: Database) -> None:
     welcome_text = (
         "👋 <b>Приветствуем в системе учёта USB-носителей с ЭЦП!</b>\n\n"
         "Я помогу вам управлять заявками на выдачу токенов для подписи документов.\n\n"
@@ -158,6 +162,12 @@ async def cmd_start(message: Message) -> None:
     )
     await message.answer(welcome_text, reply_markup=main_menu_kb())
     await message.answer(help_text(), reply_markup=main_menu_kb())
+
+    full_name = await db.get_user_full_name(message.from_user.id)
+    if not full_name:
+        await message.answer(
+            "⚠️ Для работы с заявками обязательно заполните ФИО: нажмите кнопку «🪪 Профиль (ФИО)»."
+        )
 
 
 @router.message(Command("menu"))
@@ -168,6 +178,22 @@ async def cmd_menu(message: Message) -> None:
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     await message.answer(help_text(), reply_markup=main_menu_kb())
+
+
+async def _ask_full_name(message: Message, state: FSMContext, *, next_step: str) -> None:
+    await state.set_state(RequestFSM.full_name)
+    await state.update_data(next_step=next_step)
+    await message.answer(
+        "🪪 <b>Профиль пользователя</b>\n\n"
+        "Введите ваше ФИО (обязательно):\n"
+        "<i>Фамилия Имя Отчество</i>\n\n"
+        "ФИО будет привязано к вашему tg_id и отображаться в заявках."
+    )
+
+
+@router.message(Command("profile"))
+async def cmd_profile(message: Message, state: FSMContext) -> None:
+    await _ask_full_name(message, state, next_step="menu")
 
 
 @router.message(Command("cancel"))
@@ -181,9 +207,9 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
     await message.answer("❌ Действие отменено.", reply_markup=main_menu_kb())
 
 @router.message(Command("request"))
-async def cmd_request_alias(message: Message, state: FSMContext, settings) -> None:
+async def cmd_request_alias(message: Message, state: FSMContext, settings, db: Database) -> None:
     # Шорткат к кнопке "✅ Создать заявку"
-    await cmd_request(message, state, settings)
+    await cmd_request(message, state, settings, db)
 
 
 @router.message(Command("my"))
@@ -211,14 +237,19 @@ async def btn_help(message: Message) -> None:
     await cmd_help(message)
 
 
+@router.message(F.text == BTN_PROFILE)
+async def btn_profile(message: Message, state: FSMContext) -> None:
+    await cmd_profile(message, state)
+
+
 @router.message(F.text == BTN_CANCEL)
 async def btn_cancel(message: Message, state: FSMContext) -> None:
     await cmd_cancel(message, state)
 
 
 @router.message(F.text == BTN_REQUEST)
-async def btn_request(message: Message, state: FSMContext, settings) -> None:
-    await cmd_request(message, state, settings)
+async def btn_request(message: Message, state: FSMContext, settings, db: Database) -> None:
+    await cmd_request(message, state, settings, db)
 
 
 @router.message(F.text == BTN_MY)
@@ -262,17 +293,32 @@ async def cmd_my(message: Message, db: Database) -> None:
         await message.answer("Ошибка при загрузке заявок.", reply_markup=main_menu_kb())
 
 
-async def cmd_request(message: Message, state: FSMContext, settings) -> None:
-    await state.clear()
+async def _start_request_companies_step(message: Message, state: FSMContext, settings) -> None:
     await state.set_state(RequestFSM.companies)
     await state.update_data(selected_companies=[])
-    max_companies = getattr(settings, 'max_companies_per_request', 5)
+    max_companies = getattr(settings, "max_companies_per_request", 5)
 
     await message.answer(
         f"📋 <b>Создание заявки</b>\n\n"
         f"Выберите компании (можно несколько, максимум {max_companies}).",
         reply_markup=kb_companies_multi(set(), max_companies),
     )
+
+
+async def cmd_request(message: Message, state: FSMContext, settings, db: Database) -> None:
+    await state.clear()
+
+    full_name = await db.get_user_full_name(message.from_user.id)
+    if not full_name:
+        await state.set_state(RequestFSM.full_name)
+        await message.answer(
+            "🪪 <b>Идентификация пользователя</b>\n\n"
+            "Перед первой заявкой укажите ваше ФИО (например: <i>Иванов Иван Иванович</i>).\n"
+            "Это ФИО будет привязано к вашему tg_id и отображаться в заявках."
+        )
+        return
+
+    await _start_request_companies_step(message, state, settings)
 
 
 async def cmd_pending(message: Message, db: Database, settings) -> None:
@@ -316,6 +362,33 @@ async def cmd_active(message: Message, db: Database, settings) -> None:
             request_card_text(r, items),
             reply_markup=kb_officer_actions(r.id, r.status),
         )
+
+
+@router.message(RequestFSM.full_name)
+async def msg_full_name(message: Message, state: FSMContext, db: Database, settings) -> None:
+    full_name = " ".join((message.text or "").strip().split())
+    if len(full_name) < 5:
+        await message.answer("ФИО слишком короткое. Пример: Иванов Иван Иванович")
+        return
+    if len(full_name) > 120:
+        await message.answer("ФИО слишком длинное. Максимум 120 символов.")
+        return
+    if " " not in full_name:
+        await message.answer("Укажите минимум имя и фамилию через пробел.")
+        return
+
+    data = await state.get_data()
+    next_step = data.get("next_step", "menu")
+
+    await db.set_user_full_name(message.from_user.id, full_name)
+    await message.answer(f"✅ ФИО сохранено: <b>{full_name}</b>")
+
+    if next_step == "request":
+        await _start_request_companies_step(message, state, settings)
+        return
+
+    await state.clear()
+    await message.answer("📱 <b>Главное меню</b> 👇", reply_markup=main_menu_kb())
 
 
 # -------------------------
@@ -393,10 +466,10 @@ async def cb_company_done(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 # -------------------------
-# Purpose / Comment
+# Purpose
 # -------------------------
 @router.message(RequestFSM.purpose)
-async def msg_purpose(message: Message, state: FSMContext, settings) -> None:
+async def msg_purpose(message: Message, state: FSMContext, db: Database, settings) -> None:
     purpose = (message.text or "").strip()
     max_length = getattr(settings, 'max_purpose_length', 500)
     if not purpose:
@@ -406,32 +479,10 @@ async def msg_purpose(message: Message, state: FSMContext, settings) -> None:
         await message.answer(f"Слишком длинно. Максимум {max_length} символов.")
         return
 
-    await state.update_data(purpose=purpose)
-    await state.set_state(RequestFSM.comment)
-    await message.answer(
-        "💬 <b>Комментарий</b> (не обязательно):\n\n"
-        "Напишите комментарий или отправьте «-» чтобы пропустить."
-    )
-
-
-@router.message(RequestFSM.comment)
-async def msg_comment(message: Message, state: FSMContext, db: Database, settings) -> None:
-    comment = (message.text or "").strip()
-    max_length = getattr(settings, 'max_comment_length', 300)
-
-    skip_keywords = {"-", "—", "нет", "без", "без комментария", "нет комментария", "не требуется"}
-    if comment.lower() in skip_keywords:
-        comment = ""
-
-    if comment and len(comment) > max_length:
-        await message.answer(f"Слишком длинно. Максимум {max_length} символов.")
-        return
-
     data = await state.get_data()
     companies: List[str] = data.get("companies") or []
-    purpose: str = data.get("purpose") or ""
 
-    if not companies or not purpose:
+    if not companies:
         await state.clear()
         await message.answer("Ошибка состояния. Начните заново.", reply_markup=main_menu_kb())
         return
@@ -440,10 +491,12 @@ async def msg_comment(message: Message, state: FSMContext, db: Database, setting
     try:
         request_id = await db.create_request_multi(
             tg_id=message.from_user.id,
-            username=message.from_user.username or "",
+            username=(await db.get_user_full_name(message.from_user.id))
+            or (message.from_user.full_name if message.from_user else "")
+            or (message.from_user.username or ""),
             items=items,
             purpose=purpose,
-            comment=comment or None,
+            comment=None,
         )
     except Exception as e:
         log.error("create_request_multi failed: %s", e)
@@ -776,6 +829,24 @@ async def cb_admin(call: CallbackQuery, db: Database, settings) -> None:
     if data == "adm:tokens":
         tokens = await db.list_all_tokens()
         await safe_edit_text(call, format_token_list(tokens), reply_markup=kb_back_to_admin())
+        await call.answer()
+        return
+
+    if data == "adm:authed":
+        users = await db.list_authed_users(limit=100)
+        if not users:
+            await safe_edit_text(call, "Нет авторизованных пользователей.", reply_markup=kb_back_to_admin())
+            await call.answer()
+            return
+
+        text = ["👥 <b>Авторизованные пользователи</b>", ""]
+        for row in users:
+            text.append(
+                f"• tg_id: <code>{row['tg_id']}</code> — "
+                f"{row.get('authed_at') or 'неизвестно'}"
+            )
+
+        await safe_edit_text(call, "\n".join(text), reply_markup=kb_back_to_admin())
         await call.answer()
         return
 
