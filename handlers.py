@@ -779,6 +779,24 @@ async def cb_admin(call: CallbackQuery, db: Database, settings) -> None:
         await call.answer()
         return
 
+    if data == "adm:authed":
+        users = await db.list_authed_users(limit=100)
+        if not users:
+            await safe_edit_text(call, "Нет авторизованных пользователей.", reply_markup=kb_back_to_admin())
+            await call.answer()
+            return
+
+        text = ["👥 <b>Авторизованные пользователи</b>", ""]
+        for row in users:
+            text.append(
+                f"• tg_id: <code>{row['tg_id']}</code> — "
+                f"{row.get('authed_at') or 'неизвестно'}"
+            )
+
+        await safe_edit_text(call, "\n".join(text), reply_markup=kb_back_to_admin())
+        await call.answer()
+        return
+
     if data == "adm:pending":
         rows = await db.list_requests_by_status("REQUESTED", limit=20)
         if not rows:
