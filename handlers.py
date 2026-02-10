@@ -311,6 +311,7 @@ async def cmd_request(message: Message, state: FSMContext, settings, db: Databas
     full_name = await db.get_user_full_name(message.from_user.id)
     if not full_name:
         await state.set_state(RequestFSM.full_name)
+        await state.update_data(next_step="request")
         await message.answer(
             "🪪 <b>Идентификация пользователя</b>\n\n"
             "Перед первой заявкой укажите ваше ФИО (например: <i>Иванов Иван Иванович</i>).\n"
@@ -487,13 +488,28 @@ async def msg_purpose(message: Message, state: FSMContext, db: Database, setting
         await message.answer("Ошибка состояния. Начните заново.", reply_markup=main_menu_kb())
         return
 
+    missing_companies = [c for c in companies if c not in COMPANY_TOKEN_MAP]
+    if missing_companies:
+        log.error("Missing token mapping for companies: %s", missing_companies)
+        await state.clear()
+        await message.answer(
+            "Ошибка конфигурации: для части компаний не настроены токены. Сообщите администратору.",
+            reply_markup=main_menu_kb(),
+        )
+        return
+
     items = [(c, COMPANY_TOKEN_MAP[c]) for c in companies]
+
+    from_user = message.from_user
+    fallback_username = ""
+    if from_user:
+        fallback_username = from_user.full_name or from_user.username or ""
+
     try:
         request_id = await db.create_request_multi(
             tg_id=message.from_user.id,
             username=(await db.get_user_full_name(message.from_user.id))
-            or (message.from_user.full_name if message.from_user else "")
-            or (message.from_user.username or ""),
+            or fallback_username,
             items=items,
             purpose=purpose,
             comment=None,
