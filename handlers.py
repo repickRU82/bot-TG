@@ -51,6 +51,7 @@ BTN_PENDING = "🧑‍💼 Директор: На согласовании"
 BTN_ACTIVE = "🛡 Уполномоченный: Активные"
 BTN_HELP = "ℹ️ Помощь"
 BTN_PROFILE = "🪪 Профиль (ФИО)"
+BTN_TOKENS = "🔑 Статусы токенов"
 BTN_CANCEL = "❌ Отмена"
 
 
@@ -62,6 +63,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
             [KeyboardButton(text=BTN_PENDING)],
             [KeyboardButton(text=BTN_ACTIVE)],
             [KeyboardButton(text=BTN_HELP), KeyboardButton(text=BTN_PROFILE)],
+            [KeyboardButton(text=BTN_TOKENS)],
             [KeyboardButton(text=BTN_CANCEL)],
         ],
         resize_keyboard=True,
@@ -79,6 +81,9 @@ def help_text() -> str:
         f"• <b>{BTN_ACTIVE}</b> — раздел для уполномоченного (выдача/приём токенов)\n"
         f"• <b>{BTN_HELP}</b> — показать эту справку\n"
         f"• <b>{BTN_PROFILE}</b> — заполнить/обновить ФИО\n"
+        f"• <b>{BTN_TOKENS}</b> — посмотреть какие токены свободны/заняты\n"
+        "• <b>/tokens</b> — то же действие командой\n"
+        "• Если токен занят, вы автоматически встанете в очередь и получите уведомление, когда он освободится\n"
         "• <b>/profile</b> — то же действие командой\n"
         f"• <b>{BTN_CANCEL}</b> — отменить текущее действие\n\n"
         "Если что-то не получается — напишите системному администратору."
@@ -148,6 +153,45 @@ async def safe_append_journal(
         )
     except Exception as e:
         log.warning("Journal append failed: %s: %s", type(e).__name__, e)
+
+
+def _build_tokens_status_text(tokens: List[Dict[str, Any]], user_waitlist: List[Dict[str, Any]]) -> str:
+    status_by_token = {str(t.get("token_id")): str(t.get("status", "unknown")) for t in tokens}
+    lines = ["🔑 <b>Статусы токенов по компаниям</b>", ""]
+
+    for company in COMPANIES:
+        token_id = COMPANY_TOKEN_MAP.get(company, "-")
+        token_status = status_by_token.get(token_id, "unknown")
+        status_human = {
+            "available": "✅ свободен",
+            "reserved": "🟡 занят (ожидает выдачи)",
+            "issued": "📦 выдан",
+        }.get(token_status, f"❓ {token_status}")
+        lines.append(f"• <b>{company}</b> — <code>{token_id}</code> — {status_human}")
+
+    if user_waitlist:
+        lines.extend(["", "⏳ <b>Вы в очереди:</b>"])
+        for idx, row in enumerate(user_waitlist, start=1):
+            company = row.get("company") or "(компания не указана)"
+            token_id = row.get("token_id") or "-"
+            lines.append(f"{idx}. {company} — <code>{token_id}</code>")
+
+    return "\n".join(lines)
+
+
+async def notify_waiters_for_tokens(bot, db: Database, token_ids: List[str]) -> None:
+    rows = await db.pop_waiters_for_available_tokens(token_ids)
+    for row in rows:
+        try:
+            await bot.send_message(
+                int(row["tg_id"]),
+                "🔔 <b>Токен освободился</b>\n\n"
+                f"Компания: <b>{row.get('company') or '-'}</b>\n"
+                f"Токен: <code>{row.get('token_id') or '-'}</code>\n\n"
+                "Теперь вы можете создать новую заявку.",
+            )
+        except Exception as e:
+            log.warning("Failed to notify waitlist user %s: %s", row.get("tg_id"), e)
 
 
 # -------------------------
@@ -229,6 +273,13 @@ async def cmd_active_alias(message: Message, db: Database, settings) -> None:
     # Шорткат к разделу уполномоченного
     await cmd_active(message, db, settings)
 
+
+@router.message(Command("tokens"))
+async def cmd_tokens(message: Message, db: Database) -> None:
+    tokens = await db.list_all_tokens()
+    user_waitlist = await db.list_user_waitlist(message.from_user.id, limit=20)
+    await message.answer(_build_tokens_status_text(tokens, user_waitlist), reply_markup=main_menu_kb())
+
 # -------------------------
 # Menu buttons
 # -------------------------
@@ -240,6 +291,11 @@ async def btn_help(message: Message) -> None:
 @router.message(F.text == BTN_PROFILE)
 async def btn_profile(message: Message, state: FSMContext) -> None:
     await cmd_profile(message, state)
+
+
+@router.message(F.text == BTN_TOKENS)
+async def btn_tokens(message: Message, db: Database) -> None:
+    await cmd_tokens(message, db)
 
 
 @router.message(F.text == BTN_CANCEL)
@@ -311,6 +367,7 @@ async def cmd_request(message: Message, state: FSMContext, settings, db: Databas
     full_name = await db.get_user_full_name(message.from_user.id)
     if not full_name:
         await state.set_state(RequestFSM.full_name)
+        await state.update_data(next_step="request")
         await message.answer(
             "🪪 <b>Идентификация пользователя</b>\n\n"
             "Перед первой заявкой укажите ваше ФИО (например: <i>Иванов Иван Иванович</i>).\n"
@@ -487,17 +544,53 @@ async def msg_purpose(message: Message, state: FSMContext, db: Database, setting
         await message.answer("Ошибка состояния. Начните заново.", reply_markup=main_menu_kb())
         return
 
+    missing_companies = [c for c in companies if c not in COMPANY_TOKEN_MAP]
+    if missing_companies:
+        log.error("Missing token mapping for companies: %s", missing_companies)
+        await state.clear()
+        await message.answer(
+            "Ошибка конфигурации: для части компаний не настроены токены. Сообщите администратору.",
+            reply_markup=main_menu_kb(),
+        )
+        return
+
     items = [(c, COMPANY_TOKEN_MAP[c]) for c in companies]
+
+    from_user = message.from_user
+    fallback_username = ""
+    if from_user:
+        fallback_username = from_user.full_name or from_user.username or ""
+
     try:
         request_id = await db.create_request_multi(
             tg_id=message.from_user.id,
             username=(await db.get_user_full_name(message.from_user.id))
-            or (message.from_user.full_name if message.from_user else "")
-            or (message.from_user.username or ""),
+            or fallback_username,
             items=items,
             purpose=purpose,
             comment=None,
         )
+    except RuntimeError as e:
+        err = str(e)
+        if err.startswith("TOKEN_NOT_AVAILABLE:"):
+            token_id = err.split(":", 1)[1].strip()
+            company = next((c for c, t in items if t == token_id), "Неизвестная компания")
+            joined = await db.join_waitlist(message.from_user.id, token_id, company)
+            await state.clear()
+            await message.answer(
+                "⛔ <b>Токен сейчас занят.</b>\n\n"
+                f"Компания: <b>{company}</b>\n"
+                f"Токен: <code>{token_id}</code>\n\n"
+                + ("✅ Вы добавлены в очередь и получите уведомление, когда токен освободится."
+                   if joined else "ℹ️ Вы уже в очереди на этот токен. Уведомим, когда он освободится."),
+                reply_markup=main_menu_kb(),
+            )
+            return
+
+        log.error("create_request_multi failed: %s", e)
+        await state.clear()
+        await message.answer("Ошибка создания заявки. Попробуйте ещё раз.", reply_markup=main_menu_kb())
+        return
     except Exception as e:
         log.error("create_request_multi failed: %s", e)
         await state.clear()
@@ -657,6 +750,8 @@ async def cb_director_reject(callback: CallbackQuery, db: Database, settings) ->
         request_items=items,
     )
 
+    await notify_waiters_for_tokens(callback.bot, db, [it.get("token_id") for it in items])
+
 
 # -------------------------
 # Officer callbacks
@@ -773,6 +868,8 @@ async def cb_officer_returned(callback: CallbackQuery, db: Database, settings) -
         actor_tg_id=callback.from_user.id,
         request_items=items,
     )
+
+    await notify_waiters_for_tokens(callback.bot, db, [it.get("token_id") for it in items])
 
 
 # -------------------------

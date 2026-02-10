@@ -127,6 +127,7 @@ async def startup(bot: Bot, db: Database, settings) -> None:
         BotCommand(command="cancel", description="Отмена"),
         BotCommand(command="request", description="Создать заявку"),
         BotCommand(command="my", description="Мои заявки"),
+        BotCommand(command="tokens", description="Статусы токенов"),
         BotCommand(command="pending", description="Директор: согласование"),
         BotCommand(command="active", description="Уполномоченный: активные"),
     ]
