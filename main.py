@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from aiogram import Bot, Dispatcher
@@ -74,6 +75,38 @@ class PinAuthMiddleware(BaseMiddleware):
             return
 
 
+class UpdateLoggingMiddleware(BaseMiddleware):
+    """Логирует входящие события и время обработки."""
+
+    async def __call__(
+        self,
+        handler: Callable[[Any, Dict[str, Any]], Awaitable[Any]],
+        event: Any,
+        data: Dict[str, Any],
+    ) -> Any:
+        uid: Optional[int] = None
+        etype = type(event).__name__
+        text = ""
+
+        if isinstance(event, Message) and event.from_user:
+            uid = event.from_user.id
+            text = (event.text or "")[:200]
+        elif isinstance(event, CallbackQuery) and event.from_user:
+            uid = event.from_user.id
+            text = (event.data or "")[:200]
+
+        start = time.perf_counter()
+        try:
+            result = await handler(event, data)
+            took_ms = (time.perf_counter() - start) * 1000
+            log.info("update ok type=%s uid=%s payload=%r took_ms=%.1f", etype, uid, text, took_ms)
+            return result
+        except Exception:
+            took_ms = (time.perf_counter() - start) * 1000
+            log.exception("update failed type=%s uid=%s payload=%r took_ms=%.1f", etype, uid, text, took_ms)
+            raise
+
+
 async def director_reminder_loop(bot: Bot, db: Database, settings) -> None:
     """
     Напоминания директору о заявках в статусе REQUESTED.
@@ -91,6 +124,7 @@ async def director_reminder_loop(bot: Bot, db: Database, settings) -> None:
                 after_minutes=settings.remind_after_minutes,
                 repeat_minutes=settings.remind_repeat_minutes,
             )
+            log.info("Reminder check: found %s pending requests", len(rows))
             if rows:
                 lines = [
                     "⏰ Напоминание: есть заявки на согласовании.",
@@ -151,7 +185,7 @@ async def startup(bot: Bot, db: Database, settings) -> None:
     ):
         asyncio.create_task(director_reminder_loop(bot, db, settings))
     else:
-        log.info("Director reminders disabled (check REMIND_* settings).")
+        log.info("Director reminders disabled: director_tg_id=%r remind_check_seconds=%r remind_after_minutes=%r remind_repeat_minutes=%r", getattr(settings, "director_tg_id", None), getattr(settings, "remind_check_seconds", None), getattr(settings, "remind_after_minutes", None), getattr(settings, "remind_repeat_minutes", None))
 
 
 async def main() -> None:
@@ -170,6 +204,7 @@ async def main() -> None:
     dp = Dispatcher()
     db = Database(settings.db_path)
 
+    dp.update.middleware(UpdateLoggingMiddleware())
     dp.update.middleware(PinAuthMiddleware())
     dp.include_router(router)
 

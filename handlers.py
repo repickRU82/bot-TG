@@ -1054,12 +1054,12 @@ async def cb_admin(call: CallbackQuery, db: Database, settings) -> None:
             sec = int(data.split(":")[-1])
         except Exception:
             sec = 1800
-        rows = await db.pending_over_seconds(sec)
+        rows = await db.stale_active_requests_over_seconds(sec)
         if not rows:
             await safe_edit_text(call, "Нет просроченных заявок.", reply_markup=kb_back_to_admin())
             await call.answer()
             return
-        text = [f"⏱ <b>Просроченные заявки</b> (>{sec} сек)\n"]
+        text = [f"⏱ <b>Висящие активные заявки</b> (>{sec} сек)\n"]
         for r in rows:
             items = await db.get_request_items(r.id)
             text.append(request_card_text(r, items))

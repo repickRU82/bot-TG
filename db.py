@@ -529,6 +529,23 @@ class Database:
             rows = await cur.fetchall()
             return [RequestRow(**dict(r)) for r in rows]
 
+    async def stale_active_requests_over_seconds(self, seconds: int) -> List[RequestRow]:
+        """Заявки, которые долго находятся в активных статусах и требуют внимания."""
+        async with aiosqlite.connect(self.db_path.as_posix()) as db:
+            await self._configure(db)
+            cur = await db.execute(
+                """
+                SELECT * FROM requests
+                WHERE status IN (?, ?, ?)
+                  AND requested_at IS NOT NULL
+                  AND requested_at <= DATETIME('now', ?)
+                ORDER BY requested_at ASC;
+                """,
+                (STATUS_REQUESTED, STATUS_APPROVED, STATUS_ISSUED, f"-{int(seconds)} seconds"),
+            )
+            rows = await cur.fetchall()
+            return [RequestRow(**dict(r)) for r in rows]
+
     async def pending_for_remind(self, after_minutes: int, repeat_minutes: int) -> List[RequestRow]:
         async with aiosqlite.connect(self.db_path.as_posix()) as db:
             await self._configure(db)
